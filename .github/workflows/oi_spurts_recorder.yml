@@ -1,0 +1,32 @@
+name: 1-Minute Live NSE OI Spurts Cloud Recorder
+
+on:
+  schedule:
+    # 03:40 UTC = 09:10 AM IST (Monday to Friday)
+    - cron: '40 3 * * 1-5'
+  workflow_dispatch: # Allows 1-click manual trigger anytime from GitHub UI
+
+jobs:
+  stream-to-gsheet:
+    runs-on: ubuntu-latest
+    timeout-minutes: 400
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run 1-Minute Live Streamer (09:10 AM to 03:30 PM IST)
+        env:
+          GSHEET_WEBHOOK_URL: "https://script.google.com/macros/s/AKfycbxgojskx6zSHeSPHnhqPwxVNpcbE2HfDDCon41vGRJXTLMlk8BK3h95ganuUqOCGYtz/exec"
+        run: python recorder.py
