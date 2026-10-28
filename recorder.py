@@ -76,7 +76,7 @@ def push_to_gsheet(payload: dict):
             WEBHOOK_URL,
             json=payload,
             headers={"Content-Type": "application/json"},
-            timeout=25
+            timeout=45
         )
         if r.status_code == 200:
             return True, r.text
