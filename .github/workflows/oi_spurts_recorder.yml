@@ -2,14 +2,22 @@ name: 1-Minute Live NSE OI Spurts Cloud Recorder
 
 on:
   schedule:
-    # 03:40 UTC = 09:10 AM IST (Monday to Friday)
-    - cron: '40 3 * * 1-5'
+    # 03:35 UTC = 09:05 AM IST (Primary market open trigger)
+    - cron: '35 3 * * 1-5'
+    # 03:45 UTC = 09:15 AM IST (Backup trigger if primary is delayed by GitHub queue)
+    - cron: '45 3 * * 1-5'
+    # 04:00 UTC = 09:30 AM IST (Secondary backup trigger)
+    - cron: '0 4 * * 1-5'
   workflow_dispatch: # Allows 1-click manual trigger anytime from GitHub UI
+
+concurrency:
+  group: sufi-oi-spurts-cloud
+  cancel-in-progress: false
 
 jobs:
   stream-to-gsheet:
     runs-on: ubuntu-latest
-    timeout-minutes: 400
+    timeout-minutes: 420
 
     steps:
       - name: Checkout Repository
@@ -26,7 +34,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run 1-Minute Live Streamer (09:10 AM to 03:30 PM IST)
+      - name: Run 1-Minute Live Streamer (09:05 AM to 03:31 PM IST)
         env:
           GSHEET_WEBHOOK_URL: "https://script.google.com/macros/s/AKfycbxgojskx6zSHeSPHnhqPwxVNpcbE2HfDDCon41vGRJXTLMlk8BK3h95ganuUqOCGYtz/exec"
         run: python recorder.py
