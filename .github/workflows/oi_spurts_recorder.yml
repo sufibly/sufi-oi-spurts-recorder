@@ -2,22 +2,32 @@ name: 1-Minute Live NSE OI Spurts Cloud Recorder
 
 on:
   schedule:
-    # 03:35 UTC = 09:05 AM IST (Primary market open trigger)
-    - cron: '35 3 * * 1-5'
-    # 03:45 UTC = 09:15 AM IST (Backup trigger if primary is delayed by GitHub queue)
-    - cron: '45 3 * * 1-5'
-    # 04:00 UTC = 09:30 AM IST (Secondary backup trigger)
-    - cron: '0 4 * * 1-5'
-  workflow_dispatch: # Allows 1-click manual trigger anytime from GitHub UI
+    # GitHub starts scheduled jobs late (often by hours). Firing every 15 minutes means some run always
+    # starts inside market hours; runs outside 08:50-15:30 IST exit in a few seconds.
+    - cron: '*/15 * * * 1-5'
+  push:
+    paths:
+      - 'recorder.py'
+      - '.github/workflows/oi_spurts_recorder.yml'
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'normal = record now (market hours only), test = one NSE fetch'
+        required: false
+        default: 'normal'
+
+permissions:
+  contents: write
 
 concurrency:
-  group: sufi-oi-spurts-cloud
+  # one recorder at a time; a second one waits and takes over when the first hands over
+  group: sufi-oi-spurts-${{ github.event_name == 'push' && 'test' || 'cloud' }}
   cancel-in-progress: false
 
 jobs:
   stream-to-gsheet:
     runs-on: ubuntu-latest
-    timeout-minutes: 420
+    timeout-minutes: 358
 
     steps:
       - name: Checkout Repository
@@ -34,7 +44,22 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run 1-Minute Live Streamer (09:05 AM to 03:31 PM IST)
+      - name: Run recorder
         env:
           GSHEET_WEBHOOK_URL: "https://script.google.com/macros/s/AKfycbxgojskx6zSHeSPHnhqPwxVNpcbE2HfDDCon41vGRJXTLMlk8BK3h95ganuUqOCGYtz/exec"
+          RUN_MODE: ${{ github.event_name == 'push' && 'test' || github.event.inputs.mode || 'normal' }}
+          MAX_RUN_MINUTES: "350"
         run: python recorder.py
+
+      - name: Keep the schedule alive (GitHub switches schedules off after 60 quiet days)
+        if: always() && github.event_name == 'schedule'
+        run: |
+          MONTH=$(date -u +%Y-%m)
+          if [ "$(cat HEARTBEAT.txt 2>/dev/null)" != "$MONTH" ]; then
+            echo "$MONTH" > HEARTBEAT.txt
+            git config user.name "oi-spurts-recorder"
+            git config user.email "actions@users.noreply.github.com"
+            git add HEARTBEAT.txt
+            git commit -m "heartbeat $MONTH" || true
+            git push || true
+          fi
