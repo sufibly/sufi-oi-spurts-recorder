@@ -1,17 +1,14 @@
 """
 ================================================================================
-SUFI CLOUD 1-MINUTE CONTINUOUS NSE OI SPURTS RECORDER (GITHUB ACTIONS RUNNER)
+SUFI CLOUD 1-MINUTE CONTINUOUS NSE OI SPURTS RECORDER (GITHUB ACTIONS RUNNER)  v2
 ================================================================================
-100% Autonomous Cloud Engine: Runs in GitHub Actions cloud while your PC is OFF.
-Schedule:
-  - Starts automatically at 09:05 AM IST every Monday to Friday.
-  - Automatically wipes yesterday's session at 09:13 AM IST.
-  - Streams all 220 F&O stocks every 60 seconds from 09:15 AM to 03:30 PM IST.
-  - Calculates real-time 1-minute momentum:
-      * %CHNG IN OI (Day spurt from NSE)
-      * 1-MIN %CHNG CHANGE (Delta vs last minute, e.g. 19.26 - 19.06 = +0.20%)
-      * 1-MIN OI CHANGE (Contracts delta vs last minute)
-  - Automatically terminates at 03:31 PM IST market close.
+Runs in GitHub Actions while the PC is OFF.
+  - GitHub starts scheduled jobs late (often by hours), so the workflow fires every 15 minutes all day.
+    A run that starts outside 08:50-15:30 IST exits in seconds; a run that starts inside it records.
+  - GitHub stops a job after 6 hours and the session is 6h15m: a run hands over after 5h50m and the next
+    queued run carries on (only one run records at a time).
+  - The Google Sheet script wipes yesterday's data once a day and keeps exactly one record set per minute.
+  - RUN_MODE=test : one NSE fetch, result shown on the run page, nothing written to the sheet.
 ================================================================================
 """
 
@@ -106,134 +103,138 @@ def push_to_gsheet(payload: dict):
         return False, str(e)
 
 def send_morning_reset():
-    log_msg("🧹 Executing 09:13 AM Morning Reset on Google Sheet...")
+    """Asks the sheet to wipe yesterday's data. The sheet does it once per day only, so this is always safe."""
     ok, resp = push_to_gsheet({"action": "wipe_morning_reset"})
-    log_msg(f"Reset Response: {resp}")
+    log_msg(f"Daily reset request -> {resp[:120] if isinstance(resp, str) else resp}")
+
+
+def summary(text: str):
+    """Shown on the run page (readable without opening the logs)."""
+    print(f"::notice title=OI Spurts Recorder::{text}", flush=True)
+    path = os.environ.get("GITHUB_STEP_SUMMARY")
+    if path:
+        try:
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(text + "\n\n")
+        except Exception:
+            pass
+
+
+def to_records(items, time_stamp_str):
+    records = []
+    for it in items:
+        sym = str(it.get("symbol", "")).strip()
+        if not sym:
+            continue
+        records.append({
+            "symbol": sym,
+            "pct_chg_oi": float(it.get("avgInOI") or 0.0),
+            "pct_1m_change": 0.0,          # the sheet works out the 1-minute changes
+            "oi_1m_change": 0.0,
+            "chg_oi": float(it.get("changeInOI") or 0.0),
+            "today_oi": float(it.get("latestOI") or 0.0),
+            "prev_oi": float(it.get("prevOI") or 0.0),
+            "volume": float(it.get("volume") or 0.0),
+            "futures_val": round(float(it.get("futValue") or 0.0), 2),
+            "ltp": float(it.get("underlyingValue") or 0.0),
+            "timestamp": time_stamp_str,
+        })
+    records.sort(key=lambda r: r["pct_chg_oi"], reverse=True)
+    return records
+
+
+def run_test():
+    t0 = time.time()
+    session = create_nse_session()
+    items = fetch_nse_live_spurts(session)
+    secs = round(time.time() - t0, 1)
+    now = get_ist_now().strftime("%Y-%m-%d %H:%M:%S")
+    if len(items) >= 100:
+        top = max(items, key=lambda x: float(x.get("avgInOI") or 0))
+        summary(f"TEST OK at {now} IST: NSE answered this GitHub server with {len(items)} stocks in {secs}s "
+                f"(top {top.get('symbol')} {top.get('avgInOI')}%).")
+        return 0
+    summary(f"TEST FAILED at {now} IST: NSE gave {len(items)} stocks to this GitHub server after {secs}s.")
+    return 1
+
 
 def main():
-    log_msg("🚀 Sufi Cloud 1-Minute NSE OI Spurts Recorder Initializing...")
+    mode = (os.environ.get("RUN_MODE") or "normal").strip().lower()
+    if mode == "test":
+        sys.exit(run_test())
+
+    started = time.time()
+    max_run_seconds = int(float(os.environ.get("MAX_RUN_MINUTES", "350")) * 60)
+    now_ist = get_ist_now()
+    tm = now_ist.hour * 60 + now_ist.minute
+    if now_ist.weekday() >= 5:
+        summary(f"{now_ist:%Y-%m-%d %H:%M} IST is a weekend - nothing to record.")
+        return
+    if tm < 8 * 60 + 50 or tm > 15 * 60 + 30:
+        summary(f"Started {now_ist:%Y-%m-%d %H:%M} IST, outside 08:50-15:30 - exiting (a later run records).")
+        return
+
+    log_msg("Recorder starting inside market hours.")
     session = create_nse_session()
-
     last_minute_recorded = ""
-    last_reset_date = ""
-    last_minute_symbol_data = {}  # symbol -> {"pct_chg_oi": float, "today_oi": float}
-    consecutive_empty_count = 0
-
-    log_msg("🟢 Running Market Loop (Streaming every 60 seconds until 03:30 PM IST)...")
+    reset_sent = False
+    empty = 0
+    saved = 0
+    failed = 0
 
     while True:
         try:
             now_ist = get_ist_now()
-            curr_date = now_ist.strftime("%Y-%m-%d")
             curr_minute = now_ist.strftime("%Y-%m-%d %H:%M")
-            hour = now_ist.hour
-            minute = now_ist.minute
-            day_of_week = now_ist.weekday()  # 0=Monday, 4=Friday, 5=Sat, 6=Sun
-
-            # 1. Skip weekends
-            if day_of_week in (5, 6):
-                log_msg(f"🛑 Today is weekend ({now_ist.strftime('%A')}). Market is closed. Exiting.")
+            tm = now_ist.hour * 60 + now_ist.minute
+            if tm > 15 * 60 + 30:
                 break
-
-            # 2. Terminate when market closes (03:31 PM IST)
-            if (hour > 15) or (hour == 15 and minute >= 31):
-                log_msg(f"🏁 Market closed at {curr_minute} IST. Cloud recorder finished for the day.")
+            if time.time() - started > max_run_seconds:
+                log_msg("Handing over to the next queued run (GitHub's 6-hour job limit).")
                 break
-
-            # 3. Before Market Open (before 09:10 AM IST), wait peacefully
-            if hour < 9 or (hour == 9 and minute < 10):
-                log_msg(f"⏳ Pre-market: {curr_minute} IST. Waiting for 09:10 AM...")
-                time.sleep(30)
+            if tm < 9 * 60 + 13:
+                time.sleep(20)
                 continue
-
-            # 4. Automatic 09:13 AM Morning Reset
-            if hour == 9 and minute == 13 and last_reset_date != curr_date:
+            if not reset_sent:
                 send_morning_reset()
-                last_minute_symbol_data.clear()
-                last_reset_date = curr_date
-                time.sleep(30)
+                reset_sent = True
+            if tm < 9 * 60 + 15:
+                time.sleep(10)
                 continue
 
-            # 5. Stream data if new minute
             if curr_minute != last_minute_recorded:
                 t0 = time.time()
                 items = fetch_nse_live_spurts(session)
-
                 if items:
-                    consecutive_empty_count = 0
-                    # Sort by avgInOI (% Chg in OI) descending
-                    items.sort(key=lambda x: float(x.get("avgInOI") or 0), reverse=True)
-                    time_stamp_str = now_ist.strftime("%Y-%m-%d %H:%M:%S")
-                    records = []
-
-                    for it in items:
-                        sym = str(it.get("symbol", "")).strip()
-                        raw_pct = float(it.get("avgInOI") or 0.0)      # e.g. 19.26
-                        cur_oi = float(it.get("latestOI") or 0.0)      # Today's OI
-                        prev_oi = float(it.get("prevOI") or 0.0)       # Yesterday's OI
-                        chg_oi = float(it.get("changeInOI") or 0.0)    # Today Chg vs Yesterday
-                        ltp = float(it.get("underlyingValue") or 0.0)
-                        vol = float(it.get("volume") or 0.0)
-                        fut_val = round(float(it.get("futValue") or 0.0), 2)
-
-                        # Calculate 1-Minute Change in %CHNG IN OI (e.g. 19.26 - 19.06 = +0.20)
-                        prev_data = last_minute_symbol_data.get(sym)
-                        if prev_data is not None:
-                            pct_1m_change = round(raw_pct - prev_data["pct_chg_oi"], 2)
-                            oi_1m_change = round(cur_oi - prev_data["today_oi"], 0)
-                        else:
-                            pct_1m_change = 0.0
-                            oi_1m_change = 0.0
-
-                        last_minute_symbol_data[sym] = {
-                            "pct_chg_oi": raw_pct,
-                            "today_oi": cur_oi
-                        }
-
-                        records.append({
-                            "symbol": sym,
-                            "pct_chg_oi": raw_pct,
-                            "pct_1m_change": pct_1m_change,
-                            "oi_1m_change": oi_1m_change,
-                            "chg_oi": chg_oi,
-                            "today_oi": cur_oi,
-                            "prev_oi": prev_oi,
-                            "volume": vol,
-                            "futures_val": fut_val,
-                            "ltp": ltp,
-                            "timestamp": time_stamp_str
-                        })
-
-                    ok, resp_str = push_to_gsheet({
-                        "action": "append_batch",
-                        "records": records
-                    })
-
-                    elapsed = round(time.time() - t0, 1)
-                    top_sym = records[0]["symbol"] if records else "N/A"
-                    top_pct = records[0]["pct_chg_oi"] if records else 0
-                    top_1m = records[0]["pct_1m_change"] if records else 0
-                    sign_1m = f"+{top_1m}%" if top_1m >= 0 else f"{top_1m}%"
-
+                    empty = 0
+                    records = to_records(items, now_ist.strftime("%Y-%m-%d %H:%M:%S"))
+                    ok, resp_str = push_to_gsheet({"action": "append_batch", "records": records})
+                    if not ok:                                   # one retry; the sheet ignores a minute it already has
+                        time.sleep(3)
+                        ok, resp_str = push_to_gsheet({"action": "append_batch", "records": records})
                     if ok:
-                        log_msg(f"✅ [{curr_minute} IST] Streamed {len(records)} stocks in {elapsed}s | Top: {top_sym} (Day: +{top_pct}%, 1-Min Chg: {sign_1m})")
+                        saved += 1
                         last_minute_recorded = curr_minute
+                        log_msg(f"OK [{curr_minute}] {len(records)} stocks in {round(time.time() - t0, 1)}s -> {str(resp_str)[:100]}")
                     else:
-                        log_msg(f"⚠️ [{curr_minute} IST] Push failed: {resp_str}")
+                        failed += 1
+                        log_msg(f"PUSH FAILED [{curr_minute}]: {resp_str}")
                 else:
-                    consecutive_empty_count += 1
-                    log_msg(f"⚠️ [{curr_minute} IST] NSE returned 0 records (empty count: {consecutive_empty_count}). Retrying...")
-                    if consecutive_empty_count >= 3:
-                        log_msg("🔄 Re-creating fresh NSE session...")
+                    empty += 1
+                    failed += 1
+                    log_msg(f"NSE returned nothing [{curr_minute}] (in a row: {empty})")
+                    if empty >= 2:
                         session = create_nse_session()
-                        consecutive_empty_count = 0
+                        empty = 0
 
-            sec_to_next_min = 60 - get_ist_now().second
-            time.sleep(max(min(sec_to_next_min, 10), 1))
-
+            time.sleep(max(min(60 - get_ist_now().second, 10), 1))
         except Exception as e:
-            log_msg(f"⚠️ Cloud Recorder Loop Exception (recovering): {e}")
+            log_msg(f"Loop exception (recovering): {e}")
             time.sleep(5)
+
+    summary(f"Recorded {saved} minutes ({failed} failed attempts) between {datetime.fromtimestamp(started, IST):%H:%M} "
+            f"and {get_ist_now():%H:%M} IST.")
+
 
 if __name__ == "__main__":
     main()
