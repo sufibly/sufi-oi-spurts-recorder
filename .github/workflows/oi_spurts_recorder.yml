@@ -3,7 +3,7 @@ name: 1-Minute Live NSE OI Spurts Cloud Recorder
 on:
   schedule:
     # GitHub starts scheduled jobs late (often by hours). Firing every 15 minutes means some run always
-    # starts inside market hours; runs outside 08:50-15:30 IST exit in a few seconds.
+    # starts in time; a run that starts 05:00-15:30 IST waits for 09:15 and records, others exit in seconds.
     - cron: '*/15 * * * 1-5'
   push:
     paths:
@@ -18,6 +18,7 @@ on:
 
 permissions:
   contents: write
+  actions: write
 
 concurrency:
   # one recorder at a time; a second one waits and takes over when the first hands over
@@ -45,11 +46,22 @@ jobs:
           pip install -r requirements.txt
 
       - name: Run recorder
+        id: rec
         env:
           GSHEET_WEBHOOK_URL: "https://script.google.com/macros/s/AKfycbxgojskx6zSHeSPHnhqPwxVNpcbE2HfDDCon41vGRJXTLMlk8BK3h95ganuUqOCGYtz/exec"
           RUN_MODE: ${{ github.event_name == 'push' && 'test' || github.event.inputs.mode || 'normal' }}
           MAX_RUN_MINUTES: "350"
         run: python recorder.py
+
+      - name: Hand over to a fresh run (GitHub ends a job after 6 hours)
+        if: steps.rec.outputs.handover == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          for i in 1 2 3; do
+            gh workflow run oi_spurts_recorder.yml --repo "$GITHUB_REPOSITORY" --ref "$GITHUB_REF_NAME" -f mode=normal && break
+            sleep 5
+          done
 
       - name: Keep the schedule alive (GitHub switches schedules off after 60 quiet days)
         if: always() && github.event_name == 'schedule'
