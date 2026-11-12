@@ -1,12 +1,13 @@
 """
 ================================================================================
-SUFI CLOUD 1-MINUTE CONTINUOUS NSE OI SPURTS RECORDER (GITHUB ACTIONS RUNNER)  v2
+SUFI CLOUD 1-MINUTE CONTINUOUS NSE OI SPURTS RECORDER (GITHUB ACTIONS RUNNER)  v3
 ================================================================================
 Runs in GitHub Actions while the PC is OFF.
   - GitHub starts scheduled jobs late (often by hours), so the workflow fires every 15 minutes all day.
-    A run that starts outside 08:50-15:30 IST exits in seconds; a run that starts inside it records.
-  - GitHub stops a job after 6 hours and the session is 6h15m: a run hands over after 5h50m and the next
-    queued run carries on (only one run records at a time).
+    A run that starts between 05:00 and 15:30 IST on a weekday stays: it waits for 09:15 and then records.
+    Any other run exits in seconds.
+  - GitHub stops a job after 6 hours: after 5h50m a run asks GitHub to start its own successor (the
+    workflow's "Hand over" step) and stops; the successor carries on to 15:30. Only one run works at a time.
   - The Google Sheet script wipes yesterday's data once a day and keeps exactly one record set per minute.
   - RUN_MODE=test : one NSE fetch, result shown on the run page, nothing written to the sheet.
 ================================================================================
@@ -162,6 +163,13 @@ def main():
     mode = (os.environ.get("RUN_MODE") or "normal").strip().lower()
     if mode == "test":
         sys.exit(run_test())
+    if mode == "handover_test":                    # proves that a run can start its own successor
+        out = os.environ.get("GITHUB_OUTPUT")
+        if out:
+            with open(out, "a", encoding="utf-8") as f:
+                f.write("handover=true\n")
+        summary("HANDOVER TEST: asking GitHub to start the next run now.")
+        return
 
     started = time.time()
     max_run_seconds = int(float(os.environ.get("MAX_RUN_MINUTES", "350")) * 60)
@@ -170,11 +178,12 @@ def main():
     if now_ist.weekday() >= 5:
         summary(f"{now_ist:%Y-%m-%d %H:%M} IST is a weekend - nothing to record.")
         return
-    if tm < 8 * 60 + 50 or tm > 15 * 60 + 30:
-        summary(f"Started {now_ist:%Y-%m-%d %H:%M} IST, outside 08:50-15:30 - exiting (a later run records).")
+    if tm < 5 * 60 or tm > 15 * 60 + 30:
+        summary(f"Started {now_ist:%Y-%m-%d %H:%M} IST, outside 05:00-15:30 - exiting (a later run records).")
         return
 
-    log_msg("Recorder starting inside market hours.")
+    log_msg("Recorder on duty (waits for 09:15 if early).")
+    handover = False
     session = create_nse_session()
     last_minute_recorded = ""
     reset_sent = False
@@ -190,7 +199,8 @@ def main():
             if tm > 15 * 60 + 30:
                 break
             if time.time() - started > max_run_seconds:
-                log_msg("Handing over to the next queued run (GitHub's 6-hour job limit).")
+                log_msg("Handing over to a fresh run (GitHub's 6-hour job limit).")
+                handover = True
                 break
             if tm < 9 * 60 + 13:
                 time.sleep(20)
@@ -232,8 +242,13 @@ def main():
             log_msg(f"Loop exception (recovering): {e}")
             time.sleep(5)
 
+    if handover:
+        out = os.environ.get("GITHUB_OUTPUT")
+        if out:
+            with open(out, "a", encoding="utf-8") as f:
+                f.write("handover=true\n")
     summary(f"Recorded {saved} minutes ({failed} failed attempts) between {datetime.fromtimestamp(started, IST):%H:%M} "
-            f"and {get_ist_now():%H:%M} IST.")
+            f"and {get_ist_now():%H:%M} IST." + (" Handed over to the next run." if handover else ""))
 
 
 if __name__ == "__main__":
