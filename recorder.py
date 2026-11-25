@@ -1,13 +1,14 @@
 """
 ================================================================================
-SUFI CLOUD 1-MINUTE CONTINUOUS NSE OI SPURTS RECORDER (GITHUB ACTIONS RUNNER)  v3
+SUFI CLOUD 1-MINUTE CONTINUOUS NSE OI SPURTS RECORDER (GITHUB ACTIONS RUNNER)  v4 (relay)
 ================================================================================
 Runs in GitHub Actions while the PC is OFF.
-  - GitHub starts scheduled jobs late (often by hours), so the workflow fires every 15 minutes all day.
-    A run that starts between 05:00 and 15:30 IST on a weekday stays: it waits for 09:15 and then records.
-    Any other run exits in seconds.
-  - GitHub stops a job after 6 hours: after 5h50m a run asks GitHub to start its own successor (the
-    workflow's "Hand over" step) and stops; the successor carries on to 15:30. Only one run works at a time.
+  - v4 RELAY (25-Nov-2026): GitHub's schedule is unreliable (25-Nov: no run between 04:20 and 10:38 IST, so the
+    morning was lost). Now one run keeps the job alive all week: from Sunday until Friday 15:30 IST every run
+    starts its successor itself at 5h40m (workflow_dispatch, starts within ~1 minute) and keeps recording ~12 more
+    minutes, so the two overlap and no minute is lost (the sheet keeps one record set per minute).
+    The 15-minute schedule only restarts the relay if it ever breaks (the workflow exits a scheduled run at once
+    when a relay run is already working). Public repository -> Actions minutes are free.
   - The Google Sheet script wipes yesterday's data once a day and keeps exactly one record set per minute.
   - RUN_MODE=test : one NSE fetch, result shown on the run page, nothing written to the sheet.
 ================================================================================
@@ -159,6 +160,31 @@ def run_test():
     return 1
 
 
+def relay_finished(now_ist) -> bool:
+    """The relay sleeps over the weekend: it ends Friday after 15:35 IST and on Saturday."""
+    wd, tm = now_ist.weekday(), now_ist.hour * 60 + now_ist.minute
+    return wd == 5 or (wd == 4 and tm > 15 * 60 + 35)
+
+
+def start_successor() -> bool:
+    """workflow_dispatch of this same workflow -> GitHub starts the next run within about a minute."""
+    tok, repo = os.environ.get("GH_TOKEN"), os.environ.get("GITHUB_REPOSITORY")
+    ref = os.environ.get("GITHUB_REF_NAME") or "main"
+    if not tok or not repo:
+        return False
+    try:
+        import requests as _rq
+        r = _rq.post(f"https://api.github.com/repos/{repo}/actions/workflows/oi_spurts_recorder.yml/dispatches",
+                     headers={"Authorization": f"Bearer {tok}", "Accept": "application/vnd.github+json"},
+                     json={"ref": ref, "inputs": {"mode": "normal"}}, timeout=20)
+        ok = r.status_code in (200, 204)
+        log_msg(f"Successor run requested -> HTTP {r.status_code}")
+        return ok
+    except Exception as e:
+        log_msg(f"Successor request failed: {e}")
+        return False
+
+
 def main():
     mode = (os.environ.get("RUN_MODE") or "normal").strip().lower()
     if mode == "test":
@@ -172,18 +198,17 @@ def main():
         return
 
     started = time.time()
-    max_run_seconds = int(float(os.environ.get("MAX_RUN_MINUTES", "350")) * 60)
+    handover_at = int(float(os.environ.get("HANDOVER_MINUTES", "340")) * 60)     # start the successor
+    stop_at = int(float(os.environ.get("MAX_RUN_MINUTES", "352")) * 60)          # then stop (job limit 358)
     now_ist = get_ist_now()
-    tm = now_ist.hour * 60 + now_ist.minute
-    if now_ist.weekday() >= 5:
-        summary(f"{now_ist:%Y-%m-%d %H:%M} IST is a weekend - nothing to record.")
-        return
-    if tm < 5 * 60 or tm > 15 * 60 + 30:
-        summary(f"Started {now_ist:%Y-%m-%d %H:%M} IST, outside 05:00-15:30 - exiting (a later run records).")
+    if relay_finished(now_ist):
+        summary(f"{now_ist:%Y-%m-%d %H:%M} IST: week finished (Friday after 15:30 / Saturday) - relay ends; "
+                f"Sunday's schedule starts it again.")
         return
 
-    log_msg("Recorder on duty (waits for 09:15 if early).")
+    log_msg("Recorder on duty (relay; records 09:15-15:30 IST on weekdays, waits otherwise).")
     handover = False
+    successor_started = False
     session = create_nse_session()
     last_minute_recorded = ""
     reset_sent = False
@@ -196,14 +221,20 @@ def main():
             now_ist = get_ist_now()
             curr_minute = now_ist.strftime("%Y-%m-%d %H:%M")
             tm = now_ist.hour * 60 + now_ist.minute
-            if tm > 15 * 60 + 30:
+            if relay_finished(now_ist):
                 break
-            if time.time() - started > max_run_seconds:
-                log_msg("Handing over to a fresh run (GitHub's 6-hour job limit).")
-                handover = True
+            el = time.time() - started
+            if el > handover_at and not successor_started:
+                successor_started = start_successor()
+                if not successor_started and el > handover_at + 300:
+                    handover = True                          # API failed 5 min long: let the workflow step try
+                    break
+            if el > stop_at:
+                handover = not successor_started
+                log_msg("Stopping (GitHub's 6-hour job limit); the successor carries on.")
                 break
-            if tm < 9 * 60 + 13:
-                time.sleep(20)
+            if now_ist.weekday() >= 5 or tm > 15 * 60 + 30 or tm < 9 * 60 + 13:
+                time.sleep(20)                               # outside market hours: just keep the relay alive
                 continue
             if not reset_sent:
                 send_morning_reset()
@@ -238,6 +269,8 @@ def main():
                         empty = 0
 
             time.sleep(max(min(60 - get_ist_now().second, 10), 1))
+            if get_ist_now().strftime("%Y-%m-%d") != curr_minute[:10]:
+                reset_sent = False                           # a new day inside the same run
         except Exception as e:
             log_msg(f"Loop exception (recovering): {e}")
             time.sleep(5)

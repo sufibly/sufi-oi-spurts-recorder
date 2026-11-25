@@ -2,9 +2,10 @@ name: 1-Minute Live NSE OI Spurts Cloud Recorder
 
 on:
   schedule:
-    # GitHub starts scheduled jobs late (often by hours). Firing every 15 minutes means some run always
-    # starts in time; a run that starts 05:00-15:30 IST waits for 09:15 and records, others exit in seconds.
-    - cron: '*/15 * * * 1-5'
+    # v4 relay: one run keeps the recorder alive Sunday -> Friday 15:30 IST and starts its own successor before
+    # GitHub's 6-hour limit. This schedule only (re)starts the relay; a scheduled run exits at once if a relay
+    # run is already working. Sunday is included so the relay is up long before Monday 09:15.
+    - cron: '7,22,37,52 * * * 0-5'
   push:
     paths:
       - 'recorder.py'
@@ -21,8 +22,9 @@ permissions:
   actions: write
 
 concurrency:
-  # one recorder at a time; a second one waits and takes over when the first hands over
-  group: sufi-oi-spurts-${{ github.event_name == 'push' && 'test' || 'cloud' }}
+  # relay runs overlap for ~12 minutes on purpose (no lost minute), so normal runs are not queued behind each
+  # other; duplicate relays are stopped by the "Only one relay" step instead.
+  group: sufi-oi-spurts-${{ github.event_name == 'push' && 'test' || github.run_id }}
   cancel-in-progress: false
 
 jobs:
@@ -31,26 +33,47 @@ jobs:
     timeout-minutes: 358
 
     steps:
+      - name: Only one relay (a scheduled run exits if a relay run is already working)
+        id: guard
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            n=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow oi_spurts_recorder.yml --status in_progress --json databaseId --jq "[.[] | select(.databaseId != ${{ github.run_id }})] | length")
+            if [ "${n:-0}" -gt 0 ]; then
+              echo "A relay run is already recording - nothing to do." >> "$GITHUB_STEP_SUMMARY"
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          fi
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+
       - name: Checkout Repository
+        if: steps.guard.outputs.skip != 'true'
         uses: actions/checkout@v4
 
       - name: Set up Python 3.11
+        if: steps.guard.outputs.skip != 'true'
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
           cache: 'pip'
 
       - name: Install Dependencies
+        if: steps.guard.outputs.skip != 'true'
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
       - name: Run recorder
         id: rec
+        if: steps.guard.outputs.skip != 'true'
         env:
+          GH_TOKEN: ${{ github.token }}
+          HANDOVER_MINUTES: "340"
           GSHEET_WEBHOOK_URL: "https://script.google.com/macros/s/AKfycbxgojskx6zSHeSPHnhqPwxVNpcbE2HfDDCon41vGRJXTLMlk8BK3h95ganuUqOCGYtz/exec"
           RUN_MODE: ${{ github.event_name == 'push' && 'test' || github.event.inputs.mode || 'normal' }}
-          MAX_RUN_MINUTES: "350"
+          MAX_RUN_MINUTES: "352"
         run: python recorder.py
 
       - name: Hand over to a fresh run (GitHub ends a job after 6 hours)
@@ -64,7 +87,7 @@ jobs:
           done
 
       - name: Keep the schedule alive (GitHub switches schedules off after 60 quiet days)
-        if: always() && github.event_name == 'schedule'
+        if: always() && github.event_name == 'schedule' && steps.guard.outputs.skip != 'true'
         run: |
           MONTH=$(date -u +%Y-%m)
           if [ "$(cat HEARTBEAT.txt 2>/dev/null)" != "$MONTH" ]; then
