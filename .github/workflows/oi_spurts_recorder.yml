@@ -24,7 +24,7 @@ permissions:
 concurrency:
   # relay runs overlap for ~12 minutes on purpose (no lost minute), so normal runs are not queued behind each
   # other; duplicate relays are stopped by the "Only one relay" step instead.
-  group: sufi-oi-spurts-${{ github.event_name == 'push' && 'test' || github.run_id }}
+  group: sufi-oi-spurts-${{ github.run_id }}
   cancel-in-progress: false
 
 jobs:
@@ -72,7 +72,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           HANDOVER_MINUTES: "340"
           GSHEET_WEBHOOK_URL: "https://script.google.com/macros/s/AKfycbxgojskx6zSHeSPHnhqPwxVNpcbE2HfDDCon41vGRJXTLMlk8BK3h95ganuUqOCGYtz/exec"
-          RUN_MODE: ${{ github.event_name == 'push' && 'test' || github.event.inputs.mode || 'normal' }}
+          RUN_MODE: ${{ github.event.inputs.mode || 'normal' }}   # a push starts the relay at once (test = manual run with mode test)
           MAX_RUN_MINUTES: "352"
         run: python recorder.py
 
